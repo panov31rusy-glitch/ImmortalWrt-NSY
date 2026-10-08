@@ -1,36 +1,220 @@
 From: ImmortalWrt user <noreply@example.com>
-Subject: [PATCH] PCI: dw-rockchip: vendor-like PERST# hold, link wait and retry
+Subject: [PATCH] PCI: dw-rockchip: bring up the link like the vendor kernel
 
-Add two optional DT properties, modelled after the Rockchip vendor kernel:
+Make the RC bring-up follow the Rockchip vendor (5.10) driver:
 
- - rockchip,perst-inactive-ms: time PERST# is held asserted before it is
-   released (default/minimum 100 ms, same as before).
- - rockchip,wait-for-link-ms: if set, poll for link-up for this long after
-   releasing PERST# and, if it did not come up, repeat the PERST# cycle once.
+ - rk_pcie_set_mode(): without "supports-clkreq" write 0x30011000 to
+   PCIE_CLIENT_POWER (hold CLKREQ# asserted) and hide the L1 PM substates
+   capability; with it write 0x00010001.
+ - rk_pcie_establish_link(): for every attempt assert PERST#, disable
+   LTSSM, clear the link status, enable LTSSM, hold PERST# for
+   "rockchip,perst-inactive-ms" (default 200), then poll for link-up for
+   "rockchip,wait-for-link-ms" (at least 2000). After link-up wait for a
+   Gen switch and check again. On failure power cycle the slot regulator,
+   wait 1s and retry once.
 
-Without the properties behaviour is unchanged.
+ - "rockchip,force-polling": if the LTSSM is still in Detect 200ms after
+   PERST# was released, force it to Polling.Active through the DWC Force
+   Link register. Needed where the PHY receiver detection is unreliable.
 
 ---
---- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 09:14:35.594266156 +0000
-+++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 09:14:44.316913775 +0000
-@@ -58,8 +58,12 @@
+--- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 19:18:39.548378742 +0300
++++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 22:25:11.478690563 +0300
+@@ -35,6 +35,8 @@
+ 
+ #define PCIE_CLIENT_RC_MODE		HIWORD_UPDATE_BIT(0x40)
+ #define PCIE_CLIENT_ENABLE_LTSSM	HIWORD_UPDATE_BIT(0xc)
++#define PCIE_CLIENT_DISABLE_LTSSM	HIWORD_UPDATE(0xc, 0x8)
++#define PCIE_CLIENT_SET_RC_MODE		HIWORD_UPDATE(0xf0, 0x40)
+ #define PCIE_SMLH_LINKUP		BIT(16)
+ #define PCIE_RDLH_LINKUP		BIT(17)
+ #define PCIE_LINKUP			(PCIE_SMLH_LINKUP | PCIE_RDLH_LINKUP)
+@@ -42,6 +44,9 @@
+ #define PCIE_CLIENT_GENERAL_CONTROL	0x0
+ #define PCIE_CLIENT_INTR_STATUS_LEGACY	0x8
+ #define PCIE_CLIENT_INTR_MASK_LEGACY	0x1c
++#define PCIE_CLIENT_POWER		0x2c
++#define PCIE_CLIENT_POWER_CLKREQ_READY	0x00010001
++#define PCIE_CLIENT_POWER_CLKREQ_LOW	0x30011000
+ #define PCIE_CLIENT_GENERAL_DEBUG	0x104
+ #define PCIE_CLIENT_HOT_RESET_CTRL	0x180
+ #define PCIE_CLIENT_LTSSM_STATUS	0x300
+@@ -58,8 +63,21 @@
  	struct gpio_desc		*rst_gpio;
  	struct regulator                *vpcie3v3;
  	struct irq_domain		*irq_domain;
 +	u32				perst_inactive_ms;
 +	u32				wait_for_link_ms;
++	bool				supports_clkreq;
++	bool				force_polling;
  };
  
-+#define ROCKCHIP_PCIE_ENUM_RETRIES	2
++#define ROCKCHIP_PCIE_ENUM_HW_RETRIES	2
++
++/* DWC port logic "Force Link" register */
++#define ROCKCHIP_PCIE_PORT_FORCE		0x708
++#define ROCKCHIP_PCIE_PORT_FORCE_EN		BIT(15)
++#define ROCKCHIP_PCIE_PORT_FORCE_STATE_MASK	GENMASK(21, 16)
++#define ROCKCHIP_PCIE_PORT_FORCE_POLL_ACTIVE	(0x2 << 16)
++#define ROCKCHIP_PCIE_LTSSM_DETECT_ACT		0x1
 +
  static int rockchip_pcie_readl_apb(struct rockchip_pcie *rockchip,
  					     u32 reg)
  {
-@@ -165,24 +169,50 @@
+@@ -150,6 +168,49 @@
+ 				 PCIE_CLIENT_GENERAL_CONTROL);
+ }
+ 
++static void rockchip_pcie_disable_ltssm(struct rockchip_pcie *rockchip)
++{
++	rockchip_pcie_writel_apb(rockchip, PCIE_CLIENT_DISABLE_LTSSM,
++				 PCIE_CLIENT_GENERAL_CONTROL);
++}
++
++static void rockchip_pcie_disable_aspm_l1ss(struct rockchip_pcie *rockchip)
++{
++	struct dw_pcie *pci = &rockchip->pci;
++	u32 val, l1ss;
++
++	l1ss = dw_pcie_find_ext_capability(pci, PCI_EXT_CAP_ID_L1SS);
++	if (!l1ss) {
++		dev_err(pci->dev, "can't find l1ss cap\n");
++		return;
++	}
++
++	dw_pcie_dbi_ro_wr_en(pci);
++	val = dw_pcie_readl_dbi(pci, l1ss + PCI_L1SS_CAP);
++	val &= ~(PCI_L1SS_CAP_ASPM_L1_1 | PCI_L1SS_CAP_ASPM_L1_2 |
++		 PCI_L1SS_CAP_L1_PM_SS);
++	dw_pcie_writel_dbi(pci, l1ss + PCI_L1SS_CAP, val);
++	dw_pcie_dbi_ro_wr_dis(pci);
++}
++
++/* Same as rk_pcie_set_mode() for RC in the Rockchip vendor kernel */
++static void rockchip_pcie_set_mode(struct rockchip_pcie *rockchip)
++{
++	if (rockchip->supports_clkreq) {
++		/* Application is ready to have reference clock removed */
++		rockchip_pcie_writel_apb(rockchip, PCIE_CLIENT_POWER_CLKREQ_READY,
++					 PCIE_CLIENT_POWER);
++	} else {
++		/* Pull down CLKREQ# to assert the connecting CLOCK_GEN OE */
++		rockchip_pcie_writel_apb(rockchip, PCIE_CLIENT_POWER_CLKREQ_LOW,
++					 PCIE_CLIENT_POWER);
++		rockchip_pcie_disable_aspm_l1ss(rockchip);
++	}
++
++	rockchip_pcie_writel_apb(rockchip, PCIE_CLIENT_SET_RC_MODE,
++				 PCIE_CLIENT_GENERAL_CONTROL);
++}
++
+ static int rockchip_pcie_link_up(struct dw_pcie *pci)
+ {
+ 	struct rockchip_pcie *rockchip = to_rockchip_pcie(pci);
+@@ -162,27 +223,108 @@
+ 	return 0;
+ }
+ 
++/*
++ * The receiver detection of the PHY may fail (seen with a cold SoC), so the
++ * LTSSM never leaves Detect although the device is there. Push the LTSSM to
++ * Polling.Active by hand, the link then trains as usual.
++ */
++static void rockchip_pcie_force_polling(struct rockchip_pcie *rockchip)
++{
++	struct dw_pcie *pci = &rockchip->pci;
++	u32 val;
++
++	val = dw_pcie_readl_dbi(pci, ROCKCHIP_PCIE_PORT_FORCE);
++	val &= ~ROCKCHIP_PCIE_PORT_FORCE_STATE_MASK;
++	val |= ROCKCHIP_PCIE_PORT_FORCE_POLL_ACTIVE | ROCKCHIP_PCIE_PORT_FORCE_EN;
++	dw_pcie_writel_dbi(pci, ROCKCHIP_PCIE_PORT_FORCE, val);
++}
++
  static int rockchip_pcie_start_link(struct dw_pcie *pci)
  {
  	struct rockchip_pcie *rockchip = to_rockchip_pcie(pci);
-+	int try, i;
++	int hw_retries, retries;
++	bool forced = false;
++	u32 ltssm;
++
++	/* Same sequence as rk_pcie_establish_link() in the vendor kernel */
++	for (hw_retries = 0; hw_retries < ROCKCHIP_PCIE_ENUM_HW_RETRIES;
++	     hw_retries++) {
++		/* Reset device */
++		gpiod_set_value_cansleep(rockchip->rst_gpio, 0);
++
++		rockchip_pcie_disable_ltssm(rockchip);
++		/* Clear link status */
++		rockchip_pcie_writel_apb(rockchip, 0x0, PCIE_CLIENT_GENERAL_DEBUG);
++
++		rockchip_pcie_enable_ltssm(rockchip);
++
++		/*
++		 * PCIe requires the refclk to be stable for 100µs prior to
++		 * releasing PERST and T_PVPERL (power stable to PERST# inactive)
++		 * should be a minimum of 100ms. The vendor kernel waits 200ms by
++		 * default, tunable with "rockchip,perst-inactive-ms".
++		 */
++		usleep_range(rockchip->perst_inactive_ms * 1000,
++			     (rockchip->perst_inactive_ms + 1) * 1000);
++
++		gpiod_set_value_cansleep(rockchip->rst_gpio, 1);
++
++		usleep_range(1000, 1100);
++
++		for (retries = 0; retries < rockchip->wait_for_link_ms / 20;
++		     retries++) {
++			if (rockchip_pcie_link_up(pci)) {
++				/* Wait for a possible Gen switch to finish */
++				if (pci->link_gen < 3)
++					msleep(50);
++				else
++					msleep(100);
++				/* In case link drop after linkup, double check it */
++				if (rockchip_pcie_link_up(pci)) {
++					dev_info(pci->dev, "PCIe Link up, LTSSM is 0x%x\n",
++						 rockchip_pcie_readl_apb(rockchip,
++							PCIE_CLIENT_LTSSM_STATUS));
++					return 0;
++				}
++			}
++
++			/*
++			 * Still in Detect 200ms after PERST# was released:
++			 * skip the receiver detection, again every 400ms.
++			 */
++			ltssm = rockchip_pcie_readl_apb(rockchip,
++							PCIE_CLIENT_LTSSM_STATUS);
++			if (rockchip->force_polling && retries % 20 == 10 &&
++			    (ltssm & PCIE_LTSSM_STATUS_MASK) <=
++			    ROCKCHIP_PCIE_LTSSM_DETECT_ACT) {
++				if (!forced)
++					dev_info(pci->dev,
++						 "no receiver detected, forcing LTSSM to Polling\n");
++				forced = true;
++				rockchip_pcie_force_polling(rockchip);
++			}
++
++			usleep_range(20000, 21000);
++		}
++
++		/*
++		 * Devices can't be enumerated: toggle PERST# again and power
++		 * cycle the slot (if it has a regulator), then retry.
++		 */
++		ltssm = rockchip_pcie_readl_apb(rockchip, PCIE_CLIENT_LTSSM_STATUS);
++		dev_err(pci->dev, "PCIe Link Fail, LTSSM is 0x%x, hw_retries=%d\n",
++			ltssm, hw_retries);
++		if (ltssm < 3)
++			break;
++
++		if (rockchip->vpcie3v3)
++			regulator_disable(rockchip->vpcie3v3);
++		msleep(1000);
++		if (rockchip->vpcie3v3 && regulator_enable(rockchip->vpcie3v3))
++			dev_err(pci->dev, "failed to enable vpcie3v3 regulator\n");
++	}
  
 -	/* Reset device */
 -	gpiod_set_value_cansleep(rockchip->rst_gpio, 0);
@@ -48,63 +232,39 @@ Without the properties behaviour is unchanged.
 -	 */
 -	msleep(100);
 -	gpiod_set_value_cansleep(rockchip->rst_gpio, 1);
-+	for (try = 0; try < ROCKCHIP_PCIE_ENUM_RETRIES; try++) {
-+		/* Reset device */
-+		gpiod_set_value_cansleep(rockchip->rst_gpio, 0);
-+
-+		rockchip_pcie_enable_ltssm(rockchip);
-+
-+		/*
-+		 * PCIe requires the refclk to be stable for 100µs prior to releasing
-+		 * PERST. See table 2-4 in section 2.6.2 AC Specifications of the PCI
-+		 * Express Card Electromechanical Specification, 1.1. However, we don't
-+		 * know if the refclk is coming from RC's PHY or external OSC. If it's
-+		 * from RC, so enabling LTSSM is the just right place to release #PERST.
-+		 * We need more extra time as before, rather than setting just
-+		 * 100us as we don't know how long should the device need to reset.
-+		 *
-+		 * The time PERST# is held asserted can be raised with the optional
-+		 * "rockchip,perst-inactive-ms" property, like the vendor kernel.
-+		 */
-+		msleep(rockchip->perst_inactive_ms);
-+		gpiod_set_value_cansleep(rockchip->rst_gpio, 1);
-+
-+		/*
-+		 * Optionally poll for link-up here (vendor kernel waits >= 2s) and
-+		 * redo the PERST# cycle once if the link did not come up. Without
-+		 * "rockchip,wait-for-link-ms" the behaviour is unchanged.
-+		 */
-+		if (!rockchip->wait_for_link_ms)
-+			break;
-+
-+		msleep(1);
-+		for (i = 0; i < rockchip->wait_for_link_ms / 20; i++) {
-+			if (rockchip_pcie_link_up(pci))
-+				return 0;
-+			msleep(20);
-+		}
-+
-+		dev_info(pci->dev, "PCIe link not up, LTSSM is 0x%x, try %d\n",
-+			 rockchip_pcie_readl_apb(rockchip, PCIE_CLIENT_LTSSM_STATUS),
-+			 try);
-+	}
- 
-+	/* Ignore errors, the link may come up later (core waits once more) */
+-
++	/* Keep the host bridge registered, the core reports the missing link */
  	return 0;
  }
  
-@@ -244,6 +274,15 @@
+@@ -208,8 +350,10 @@
+ 	/* LTSSM enable control mode */
+ 	rockchip_pcie_writel_apb(rockchip, val, PCIE_CLIENT_HOT_RESET_CTRL);
+ 
+-	rockchip_pcie_writel_apb(rockchip, PCIE_CLIENT_RC_MODE,
+-				 PCIE_CLIENT_GENERAL_CONTROL);
++	rockchip_pcie_set_mode(rockchip);
++	dev_info(dev, "PCIE_CLIENT_POWER is 0x%x, clkreq %s\n",
++		 rockchip_pcie_readl_apb(rockchip, PCIE_CLIENT_POWER),
++		 rockchip->supports_clkreq ? "supported" : "forced low");
+ 
+ 	return 0;
+ }
+@@ -244,6 +388,18 @@
  	if (IS_ERR(rockchip->rst_gpio))
  		return PTR_ERR(rockchip->rst_gpio);
  
-+	/* optional, defaults keep the old behaviour (100ms, no extra wait) */
-+	rockchip->perst_inactive_ms = 100;
++	/* Same properties and defaults as the vendor kernel */
++	rockchip->perst_inactive_ms = 200;
 +	of_property_read_u32(pdev->dev.of_node, "rockchip,perst-inactive-ms",
 +			     &rockchip->perst_inactive_ms);
-+	if (rockchip->perst_inactive_ms < 100)
-+		rockchip->perst_inactive_ms = 100;
 +	of_property_read_u32(pdev->dev.of_node, "rockchip,wait-for-link-ms",
 +			     &rockchip->wait_for_link_ms);
++	rockchip->wait_for_link_ms = max_t(u32, rockchip->wait_for_link_ms, 2000);
++	rockchip->supports_clkreq = of_property_read_bool(pdev->dev.of_node,
++							  "supports-clkreq");
++	rockchip->force_polling = of_property_read_bool(pdev->dev.of_node,
++						"rockchip,force-polling");
 +
  	rockchip->rst = devm_reset_control_array_get_exclusive(&pdev->dev);
  	if (IS_ERR(rockchip->rst))
