@@ -1,0 +1,111 @@
+From: ImmortalWrt user <noreply@example.com>
+Subject: [PATCH] PCI: dw-rockchip: vendor-like PERST# hold, link wait and retry
+
+Add two optional DT properties, modelled after the Rockchip vendor kernel:
+
+ - rockchip,perst-inactive-ms: time PERST# is held asserted before it is
+   released (default/minimum 100 ms, same as before).
+ - rockchip,wait-for-link-ms: if set, poll for link-up for this long after
+   releasing PERST# and, if it did not come up, repeat the PERST# cycle once.
+
+Without the properties behaviour is unchanged.
+
+---
+--- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 09:14:35.594266156 +0000
++++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c	2026-10-08 09:14:44.316913775 +0000
+@@ -58,8 +58,12 @@
+ 	struct gpio_desc		*rst_gpio;
+ 	struct regulator                *vpcie3v3;
+ 	struct irq_domain		*irq_domain;
++	u32				perst_inactive_ms;
++	u32				wait_for_link_ms;
+ };
+ 
++#define ROCKCHIP_PCIE_ENUM_RETRIES	2
++
+ static int rockchip_pcie_readl_apb(struct rockchip_pcie *rockchip,
+ 					     u32 reg)
+ {
+@@ -165,24 +169,50 @@
+ static int rockchip_pcie_start_link(struct dw_pcie *pci)
+ {
+ 	struct rockchip_pcie *rockchip = to_rockchip_pcie(pci);
++	int try, i;
+ 
+-	/* Reset device */
+-	gpiod_set_value_cansleep(rockchip->rst_gpio, 0);
+-
+-	rockchip_pcie_enable_ltssm(rockchip);
+-
+-	/*
+-	 * PCIe requires the refclk to be stable for 100µs prior to releasing
+-	 * PERST. See table 2-4 in section 2.6.2 AC Specifications of the PCI
+-	 * Express Card Electromechanical Specification, 1.1. However, we don't
+-	 * know if the refclk is coming from RC's PHY or external OSC. If it's
+-	 * from RC, so enabling LTSSM is the just right place to release #PERST.
+-	 * We need more extra time as before, rather than setting just
+-	 * 100us as we don't know how long should the device need to reset.
+-	 */
+-	msleep(100);
+-	gpiod_set_value_cansleep(rockchip->rst_gpio, 1);
++	for (try = 0; try < ROCKCHIP_PCIE_ENUM_RETRIES; try++) {
++		/* Reset device */
++		gpiod_set_value_cansleep(rockchip->rst_gpio, 0);
++
++		rockchip_pcie_enable_ltssm(rockchip);
++
++		/*
++		 * PCIe requires the refclk to be stable for 100µs prior to releasing
++		 * PERST. See table 2-4 in section 2.6.2 AC Specifications of the PCI
++		 * Express Card Electromechanical Specification, 1.1. However, we don't
++		 * know if the refclk is coming from RC's PHY or external OSC. If it's
++		 * from RC, so enabling LTSSM is the just right place to release #PERST.
++		 * We need more extra time as before, rather than setting just
++		 * 100us as we don't know how long should the device need to reset.
++		 *
++		 * The time PERST# is held asserted can be raised with the optional
++		 * "rockchip,perst-inactive-ms" property, like the vendor kernel.
++		 */
++		msleep(rockchip->perst_inactive_ms);
++		gpiod_set_value_cansleep(rockchip->rst_gpio, 1);
++
++		/*
++		 * Optionally poll for link-up here (vendor kernel waits >= 2s) and
++		 * redo the PERST# cycle once if the link did not come up. Without
++		 * "rockchip,wait-for-link-ms" the behaviour is unchanged.
++		 */
++		if (!rockchip->wait_for_link_ms)
++			break;
++
++		msleep(1);
++		for (i = 0; i < rockchip->wait_for_link_ms / 20; i++) {
++			if (rockchip_pcie_link_up(pci))
++				return 0;
++			msleep(20);
++		}
++
++		dev_info(pci->dev, "PCIe link not up, LTSSM is 0x%x, try %d\n",
++			 rockchip_pcie_readl_apb(rockchip, PCIE_CLIENT_LTSSM_STATUS),
++			 try);
++	}
+ 
++	/* Ignore errors, the link may come up later (core waits once more) */
+ 	return 0;
+ }
+ 
+@@ -244,6 +274,15 @@
+ 	if (IS_ERR(rockchip->rst_gpio))
+ 		return PTR_ERR(rockchip->rst_gpio);
+ 
++	/* optional, defaults keep the old behaviour (100ms, no extra wait) */
++	rockchip->perst_inactive_ms = 100;
++	of_property_read_u32(pdev->dev.of_node, "rockchip,perst-inactive-ms",
++			     &rockchip->perst_inactive_ms);
++	if (rockchip->perst_inactive_ms < 100)
++		rockchip->perst_inactive_ms = 100;
++	of_property_read_u32(pdev->dev.of_node, "rockchip,wait-for-link-ms",
++			     &rockchip->wait_for_link_ms);
++
+ 	rockchip->rst = devm_reset_control_array_get_exclusive(&pdev->dev);
+ 	if (IS_ERR(rockchip->rst))
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(rockchip->rst),
