@@ -106,6 +106,11 @@ git clone --depth=1 https://github.com/sirpdboy/luci-app-eqosplus package/luci-a
 #上游已经把编译器资源包删除了，先禁用吧
 sed -i 's/ci-llvm=true/ci-llvm=false/g' feeds/packages/lang/rust/Makefile
 
+# PCIe/MT7916: удержание PERST# и повтор поднятия линка, как в вендорском ядре
+cp -f $GITHUB_WORKSPACE/configfiles/704-pci-dw-rockchip-perst-hold-and-link-retry.patch target/linux/rockchip/patches-6.6/
+DTS=target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/rk3568-nsy-g68-plus.dts
+sed -i '/rockchip,perst-inactive-ms/a\\t\trockchip,wait-for-link-ms = <2000>;' $DTS
+grep -q 'wait-for-link-ms' $DTS || { echo "DTS edit failed"; exit 1; }
 
 ./scripts/feeds update -a
 ./scripts/feeds install -a
